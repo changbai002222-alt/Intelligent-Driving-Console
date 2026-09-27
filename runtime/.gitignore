@@ -1,6 +1,8 @@
 *
 !.gitignore
 !config.example.json
+!convoy.example.json
+!convoy-observer.example.env
 !logs/
 logs/*
 !logs/.gitkeep

@@ -1,0 +1,21 @@
+{
+  "_comment": "两车协同（跟驰）配置。复制成 runtime/convoy.json 再改；convoy.json 已被 .gitignore 忽略，不会进仓库。",
+  "_observer_token": "车端 convoy_observer.py 上报遥测时带的 X-Observer-Token。⚠️ 必须换成随机值，别用这里的占位符。生成方法：python -c \"import secrets;print(secrets.token_hex(16))\"",
+  "observer_token": "REPLACE_ME_WITH_RANDOM_HEX",
+  "_fresh_seconds": "遥测超过这个秒数就算过期，该车不再参与判断",
+  "fresh_seconds": 1.5,
+  "_hold_seconds": "建议停车后至少保持多少秒才允许恢复（0 = 不额外保持，靠 FollowingAdvice 自带的迟滞）",
+  "hold_seconds": 0,
+  "_arm": "⚠️ false = 只算建议、绝不下发；true = 按建议真的对车下发动作（目前只实现 stop -> emergency_stop）",
+  "arm": false,
+  "_stop_base_m": "停车基础间距（米）：车身长 + 想保留的静止间隔",
+  "stop_base_m": 5.0,
+  "_estop_lag_s": "实测的急停耗时（秒）：车端 emergency_stop 从发出到停下的时间。用于预算制动距离",
+  "estop_lag_s": 7.0,
+  "_stop_margin_m": "额外安全余量（米）",
+  "stop_margin_m": 1.0,
+  "_min_speed_mps": "车端速度下限",
+  "min_speed_mps": 0.2,
+  "_max_speed_mps": "车端速度上限",
+  "max_speed_mps": 2.0
+}

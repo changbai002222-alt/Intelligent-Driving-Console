@@ -22,11 +22,14 @@ echo "==> 收集文件"
 mkdir -p "$PKG/backend" "$PKG/runtime" "$PKG/docs" "$PKG/public" "$PKG/deploy"
 
 # 本机管理平台：只需要这几个后端文件
+# ⚠️ convoy.py 和 convoy_policy.py 必须一起拷：fleet.py 里 `from convoy import Convoy`，
+#    而 convoy.py 又 `from convoy_policy import ...`。漏任何一个，打出来的包一启动就 ImportError。
 cp "$HERE/backend/fleet.py" "$HERE/backend/app.py" "$HERE/backend/controller.py" \
-   "$HERE/backend/ros_probe.py" "$HERE/backend/ros_bridge.py" "$PKG/backend/"
+   "$HERE/backend/ros_probe.py" "$HERE/backend/ros_bridge.py" \
+   "$HERE/backend/convoy.py" "$HERE/backend/convoy_policy.py" "$PKG/backend/"
 cp -R "$HERE/dist" "$PKG/dist"
 cp -R "$HERE/public/." "$PKG/public/" 2>/dev/null || true
-cp "$HERE/docs/FLEET.md" "$HERE/docs/LIVE_VIEW.md" "$PKG/docs/" 2>/dev/null || true
+cp "$HERE/docs/FLEET.md" "$HERE/docs/LIVE_VIEW.md" "$HERE/docs/CONVOY.md" "$PKG/docs/" 2>/dev/null || true
 
 echo "==> 预置车辆（实训车01 / 实训车03）"
 # 控制令牌与车端 runtime/config.json 的 control_token 一致，客户不用再输
@@ -52,6 +55,30 @@ for key, vehicle in data["vehicles"].items():
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(data, handle, ensure_ascii=False, indent=2)
 print("  已写入", ", ".join("%s(%s)" % (v["name"], v["ip"]) for v in data["vehicles"].values()))
+PY
+
+echo "==> 生成协同（跟驰）配置"
+# ⚠️ convoy.json 已被 runtime/.gitignore 忽略，所以每一份包都现场生成、token 各不相同。
+#    车端 observer 必须用【同一个 token】才能推数据上来（见 docs/CONVOY.md）。
+python3 - "$PKG/runtime/convoy.json" <<'PY'
+import json, secrets, sys
+path = sys.argv[1]
+token = secrets.token_hex(16)
+config = {
+    "observer_token": token,
+    "fresh_seconds": 1.5,
+    "hold_seconds": 0,
+    "arm": False,            # ⚠️ false = 只算建议；true 才会真的对车下发急停
+    "stop_base_m": 5.0,
+    "estop_lag_s": 7.0,
+    "stop_margin_m": 1.0,
+    "min_speed_mps": 0.2,
+    "max_speed_mps": 2.0,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(config, handle, ensure_ascii=False, indent=2)
+print("  observer_token =", token)
+print("  ⚠️ 车端 observer 的配置里必须填【同一个 token】")
 PY
 
 cat > "$PKG/start.bat" <<'BAT'

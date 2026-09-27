@@ -17,7 +17,9 @@ import uuid
 from collections import Counter
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+
+from convoy import Convoy, ConvoyError
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTIONS = ['environment_check', 'start_hardware', 'start_autoware', 'start_localization', 'load_route', 'start_tracking']
@@ -51,6 +53,12 @@ class Fleet:
         self.vehicles = {}
         self.jobs = []
         self.states = {}
+        # ⭐ 协同（跟驰）模块。配置故意放在【单独文件】而不是 settings ——
+        #    因为 /api/fleet/settings 只接受固定的四个键，会把别的键丢掉。
+        self.convoy_config = self.load_convoy_config()
+        self.convoy = Convoy(self.convoy_config)
+        self.convoy_route_attempt = 0.0
+        self.convoy_armed = bool(self.convoy_config.get('arm'))
         if self.path.exists():
             saved = json.loads(self.path.read_text())
             self.settings.update(saved['settings'])
@@ -88,6 +96,104 @@ class Fleet:
             if identifier not in self.vehicles:
                 raise FleetError('车辆不存在')
             return dict(self.vehicles[identifier])
+
+    # ---------------------------------------------------------------- 协同（跟驰）
+
+    def load_convoy_config(self):
+        """协同模块的配置：单独文件 runtime/convoy.json。
+
+        ⚠️ 不放进 self.settings —— /api/fleet/settings 只接受四个固定键，
+           塞进去的别的键会在下次保存时被丢掉。
+        """
+        path = self.path.parent / 'convoy.json'
+        try:
+            if path.exists():
+                data = json.loads(path.read_text())
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            print(f'[convoy] 配置读取失败，改用默认值：{exc}', flush=True)
+        return {}
+
+    def telemetry(self, payload):
+        """接收一条车端 observer 推来的遥测（只读，绝不下发车端动作）。
+
+        路径是【懒加载】的：第一次拿到遥测时，从车端拉一次 /api/route，
+        交给 convoy_policy 做投影准备。失败按 15 秒限流重试，不会每帧都打。
+        """
+        self.ensure_convoy_route(payload)
+        return self.convoy.ingest(payload)
+
+    def ensure_convoy_route(self, payload):
+        if self.convoy.route is not None:
+            return
+        name = str((payload or {}).get('route') or '').strip()
+        if not name:
+            return
+        now = time.time()
+        if now - self.convoy_route_attempt < 15:
+            return
+        self.convoy_route_attempt = now
+        with self.lock:
+            vehicles = list(self.vehicles.values())
+        for vehicle in vehicles:
+            try:
+                data = self.request(vehicle, f'/api/route?file={quote(name)}')
+                points = [(float(p['x']), float(p['y'])) for p in data.get('points', [])]
+                if len(points) < 4:
+                    continue
+                length = self.convoy.load_route(points, name)
+                print(f'[convoy] 已加载路径 {name}：{len(points)} 点 / {length:.2f} m', flush=True)
+                return
+            except Exception:
+                continue
+
+    def convoy_view(self):
+        """协同状态：每车的位置/健康度 + 两两跟驰建议。"""
+        view = self.convoy.status()
+        view['armed'] = self.convoy_armed
+        return view
+
+    def find_vehicle(self, name):
+        """按车辆名称找 id。车端 observer 上报的是名字（不是平台的内部 id）。"""
+        with self.lock:
+            for identifier, vehicle in self.vehicles.items():
+                if vehicle.get('name') == name:
+                    return identifier
+        return None
+
+    def convoy_enforce(self):
+        """执行一次协同建议。⚠️ 只在 arm=True 时由后台线程调用。
+
+        ⭐ 目前【只实现 stop】：
+             stop  -> self.emergency()，即车端 emergency_stop —— 这条已经实测验证有效。
+        ⚠️  deliberately 不实现 slow：
+             slow 需要"往下压 velocity_max"，而那条路（运行时降速）我们还没在真车上
+             验证过到底生不生效。宁可少做，也不要在没验证的通道上下发。
+             想开的时候再补，代码里留了位置。
+
+        返回本次真正发出的动作列表（空列表 = 什么都没做），便于审计。
+        """
+        if not self.convoy_armed:
+            return []
+        done = []
+        for advice in self.convoy_view()['advice']:
+            if advice.get('state') != 'stop':
+                continue
+            name = advice.get('behind')
+            identifier = self.find_vehicle(name)
+            if not identifier:
+                done.append({'behind': name, 'result': 'vehicle_not_registered'})
+                continue
+            try:
+                self.emergency(identifier)
+                done.append({'behind': name, 'result': 'emergency_stop_sent',
+                             'reason': advice.get('reason')})
+                print(f'[convoy] 执行停车避让：{name} —— {advice.get("reason")}', flush=True)
+            except Exception as exc:
+                done.append({'behind': name, 'result': f'failed: {exc}'})
+                print(f'[convoy] 停车避让下发失败：{name} —— {exc}', flush=True)
+        return done
 
     def request(self, vehicle, path='/api/state', body=None):
         connection = http.client.HTTPConnection(vehicle['ip'], vehicle['port'], timeout=12)
@@ -580,6 +686,10 @@ class Handler(SimpleHTTPRequestHandler):
             parts = urlparse(self.path).path.strip('/').split('/')
             if self.path == '/api/fleet/state':
                 self.reply(self.fleet.snapshot())
+            elif self.path == '/api/convoy':
+                # ⭐ 协同（跟驰）状态：每车位置/位姿健康度 + 两两跟驰建议。
+                #    只读接口，不下发任何车端动作。仅本机同源可访问（valid_origin 已校验）。
+                self.reply(self.fleet.convoy_view())
             elif len(parts) == 7 and parts[:3] == ['api', 'fleet', 'vehicles'] and parts[4:] == ['proxy', 'api', 'screen']:
                 self.screen(self.fleet.vehicle(parts[3]))
             elif self.path.startswith('/api/'):
@@ -597,6 +707,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.reply({'error': str(exc)}, 400)
 
     def do_POST(self):
+        # ⭐ 车端 observer 是从 192.168.31.x 推过来的：既不是本机同源、也没有 Origin，
+        #    所以必须在 valid_origin 之前单独放行 —— 它改用独立令牌（X-Observer-Token）把关。
+        if urlparse(self.path).path == '/api/telemetry':
+            self.telemetry()
+            return
         if not self.valid_origin() or 'application/json' not in self.headers.get('Content-Type', ''):
             self.reply({'error': '仅允许本机同源 JSON 请求'}, 403)
             return
@@ -662,6 +777,26 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as exc:
             self.reply({'error': str(exc)}, 400)
 
+    def telemetry(self):
+        """接收车端 convoy_observer.py 的遥测（只读）。
+
+        和别的接口不同，这个走【独立令牌】而不是 valid_origin：
+        车端从 192.168.31.x 推过来，Host/Origin 都不可能是本机。
+        """
+        try:
+            if 'application/json' not in self.headers.get('Content-Type', ''):
+                raise ConvoyError('需要 JSON 请求体')
+            if not self.fleet.convoy.check_token(self.headers.get('X-Observer-Token')):
+                self.reply({'error': '观察器令牌无效'}, 401)
+                return
+            length = int(self.headers.get('Content-Length', 0))
+            if not 0 < length <= 65536:
+                raise ConvoyError('无效请求长度')
+            payload = json.loads(self.rfile.read(length))
+            self.reply(self.fleet.telemetry(payload))
+        except Exception as exc:
+            self.reply({'error': str(exc)}, 400)
+
     def screen(self, vehicle):
         if self.headers.get('Upgrade', '').lower() != 'websocket':
             raise FleetError('需要 WebSocket')
@@ -697,6 +832,22 @@ def main():
     handler = type('FleetHandler', (Handler,), {'fleet': fleet})
     server = ThreadingHTTPServer(('127.0.0.1', args.port), handler)
     threading.Thread(target=fleet.poll, daemon=True).start()
+
+    # ⭐ 协同（跟驰）执行线程：只在配置里 arm=true 时才真跑。
+    #    默认不 arm —— 因为"真的动车的速度/停它"必须是有人明确打开的决定。
+    if fleet.convoy_armed:
+        def convoy_loop():
+            while True:
+                try:
+                    fleet.convoy_enforce()
+                except Exception as exc:
+                    print(f'[convoy] 执行循环异常：{exc}', flush=True)
+                time.sleep(1.0)
+        threading.Thread(target=convoy_loop, daemon=True).start()
+        print('[convoy] ⚠️ 协同执行已开启（arm=true）—— 将按建议真的下发急停', flush=True)
+    else:
+        print('[convoy] 协同处于【只读】模式（arm=false）：只算建议，不下发任何车端动作', flush=True)
+
     print(f'智能驾驶管理平台 http://127.0.0.1:{args.port}/fleet', flush=True)
     try:
         server.serve_forever()

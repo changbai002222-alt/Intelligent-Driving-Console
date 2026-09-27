@@ -1,0 +1,15 @@
+[Unit]
+Description=Bigcar convoy observer (read-only telemetry to the local fleet platform)
+After=docker.service bigcar-console.service
+Requires=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/nvidia/Desktop/bigcar-console/deploy/convoy-run.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
